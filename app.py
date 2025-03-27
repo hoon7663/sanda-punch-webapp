@@ -7,6 +7,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import timedelta
 import time
+import math
 
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose()
@@ -15,12 +16,23 @@ st.set_page_config(page_title="산타 타격 횟수 분석기", layout="centered
 st.title("산타 타격 횟수 분석기")
 
 st.markdown("""
-정확도 향상 + 점프 동작 필터링 ✅  
-작은 움직임 무시 + 킥은 앞/옆 방향만 인식되며,  
-뛰는 동작은 킥으로 간주되지 않도록 개선되었습니다.
+🎯 정밀도 최상위 버전입니다.  
+- 수직 이동 제외  
+- 일정 속도 이상만 타격 인식  
+- 관절 꺾임 각도 변화 기반 동작 분석 강화
 """)
 
 uploaded_file = st.file_uploader("분석할 영상 파일(mp4)을 업로드하세요", type=["mp4", "avi"])
+
+def calculate_angle(a, b, c):
+    a = np.array(a)
+    b = np.array(b)
+    c = np.array(c)
+    ba = a - b
+    bc = c - b
+    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+    angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+    return np.degrees(angle)
 
 if uploaded_file:
     tfile = tempfile.NamedTemporaryFile(delete=False)
@@ -43,16 +55,25 @@ if uploaded_file:
     prev_blue_foot = None
     prev_red_foot = None
 
+    prev_left_arm_angle = None
+    prev_right_arm_angle = None
+    prev_left_leg_angle = None
+    prev_right_leg_angle = None
+
     last_blue_punch_time = 0
     last_red_punch_time = 0
     last_blue_kick_time = 0
     last_red_kick_time = 0
 
-    movement_threshold = 60  # 타격 감도
-    cooldown = 0.5  # 중복 방지 시간
+    movement_threshold = 60
+    cooldown = 0.5
+    min_speed = 100
+    min_angle_change = 15  # 관절 각도 변화 기준
 
     frame_num = 0
     events = []
+
+    prev_time = time.time()
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -68,63 +89,78 @@ if uploaded_file:
         frame_center = frame.shape[1] // 2
         timestamp = str(timedelta(seconds=frame_num / fps))
 
+        now = time.time()
+        time_diff = now - prev_time
+        prev_time = now
+
         if results.pose_landmarks:
-            landmarks = results.pose_landmarks.landmark
+            lms = results.pose_landmarks.landmark
 
-            left_hand = (int(landmarks[mp_pose.PoseLandmark.LEFT_WRIST].x * frame.shape[1]),
-                         int(landmarks[mp_pose.PoseLandmark.LEFT_WRIST].y * frame.shape[0]))
-            right_hand = (int(landmarks[mp_pose.PoseLandmark.RIGHT_WRIST].x * frame.shape[1]),
-                          int(landmarks[mp_pose.PoseLandmark.RIGHT_WRIST].y * frame.shape[0]))
-            left_foot = (int(landmarks[mp_pose.PoseLandmark.LEFT_ANKLE].x * frame.shape[1]),
-                         int(landmarks[mp_pose.PoseLandmark.LEFT_ANKLE].y * frame.shape[0]))
-            right_foot = (int(landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE].x * frame.shape[1]),
-                          int(landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE].y * frame.shape[0]))
+            lh = (int(lms[mp_pose.PoseLandmark.LEFT_WRIST].x * frame.shape[1]), int(lms[mp_pose.PoseLandmark.LEFT_WRIST].y * frame.shape[0]))
+            rh = (int(lms[mp_pose.PoseLandmark.RIGHT_WRIST].x * frame.shape[1]), int(lms[mp_pose.PoseLandmark.RIGHT_WRIST].y * frame.shape[0]))
+            la = (int(lms[mp_pose.PoseLandmark.LEFT_ANKLE].x * frame.shape[1]), int(lms[mp_pose.PoseLandmark.LEFT_ANKLE].y * frame.shape[0]))
+            ra = (int(lms[mp_pose.PoseLandmark.RIGHT_ANKLE].x * frame.shape[1]), int(lms[mp_pose.PoseLandmark.RIGHT_ANKLE].y * frame.shape[0]))
 
-            now = time.time()
+            lel = (int(lms[mp_pose.PoseLandmark.LEFT_ELBOW].x * frame.shape[1]), int(lms[mp_pose.PoseLandmark.LEFT_ELBOW].y * frame.shape[0]))
+            rel = (int(lms[mp_pose.PoseLandmark.RIGHT_ELBOW].x * frame.shape[1]), int(lms[mp_pose.PoseLandmark.RIGHT_ELBOW].y * frame.shape[0]))
+            lsh = (int(lms[mp_pose.PoseLandmark.LEFT_SHOULDER].x * frame.shape[1]), int(lms[mp_pose.PoseLandmark.LEFT_SHOULDER].y * frame.shape[0]))
+            rsh = (int(lms[mp_pose.PoseLandmark.RIGHT_SHOULDER].x * frame.shape[1]), int(lms[mp_pose.PoseLandmark.RIGHT_SHOULDER].y * frame.shape[0]))
 
-            # 펀치 감지
-            for hand, prev_hand, side in [
-                (left_hand, prev_blue_hand, 'blue'),
-                (right_hand, prev_red_hand, 'red')
-            ]:
-                if prev_hand and np.linalg.norm(np.array(hand) - np.array(prev_hand)) > movement_threshold:
-                    if hand[0] < frame_center and now - last_blue_punch_time > cooldown:
-                        blue_punch_count += 1
-                        last_blue_punch_time = now
-                        events.append((timestamp, "파란 선수", "펀치"))
-                    elif hand[0] >= frame_center and now - last_red_punch_time > cooldown:
-                        red_punch_count += 1
-                        last_red_punch_time = now
-                        events.append((timestamp, "빨간 선수", "펀치"))
-                if hand[0] < frame_center:
-                    prev_blue_hand = hand
-                else:
-                    prev_red_hand = hand
+            lkn = (int(lms[mp_pose.PoseLandmark.LEFT_KNEE].x * frame.shape[1]), int(lms[mp_pose.PoseLandmark.LEFT_KNEE].y * frame.shape[0]))
+            rkn = (int(lms[mp_pose.PoseLandmark.RIGHT_KNEE].x * frame.shape[1]), int(lms[mp_pose.PoseLandmark.RIGHT_KNEE].y * frame.shape[0]))
+            lhip = (int(lms[mp_pose.PoseLandmark.LEFT_HIP].x * frame.shape[1]), int(lms[mp_pose.PoseLandmark.LEFT_HIP].y * frame.shape[0]))
+            rhip = (int(lms[mp_pose.PoseLandmark.RIGHT_HIP].x * frame.shape[1]), int(lms[mp_pose.PoseLandmark.RIGHT_HIP].y * frame.shape[0]))
 
-            # 킥 감지 (앞/옆 방향만, 수직 이동 제외)
-            for foot, prev_foot, side in [
-                (left_foot, prev_blue_foot, 'blue'),
-                (right_foot, prev_red_foot, 'red')
-            ]:
-                if prev_foot:
-                    total_movement = np.linalg.norm(np.array(foot) - np.array(prev_foot))
-                    horizontal_movement = abs(foot[0] - prev_foot[0])  # X축
-                    vertical_movement = abs(foot[1] - prev_foot[1])    # Y축
+            left_arm_angle = calculate_angle(lsh, lel, lh)
+            right_arm_angle = calculate_angle(rsh, rel, rh)
+            left_leg_angle = calculate_angle(lhip, lkn, la)
+            right_leg_angle = calculate_angle(rhip, rkn, ra)
 
-                    if horizontal_movement > 40 and total_movement > movement_threshold:
-                        if foot[0] < frame_center and now - last_blue_kick_time > cooldown:
-                            blue_kick_count += 1
-                            last_blue_kick_time = now
-                            events.append((timestamp, "파란 선수", "킥"))
-                        elif foot[0] >= frame_center and now - last_red_kick_time > cooldown:
-                            red_kick_count += 1
-                            last_red_kick_time = now
-                            events.append((timestamp, "빨간 선수", "킥"))
+            def movement_valid(curr, prev):
+                dist = np.linalg.norm(np.array(curr) - np.array(prev))
+                return dist > movement_threshold and dist / max(time_diff, 0.01) > min_speed
 
-                if foot[0] < frame_center:
-                    prev_blue_foot = foot
-                else:
-                    prev_red_foot = foot
+            if (
+                prev_left_arm_angle and abs(left_arm_angle - prev_left_arm_angle) > min_angle_change and
+                prev_blue_hand and movement_valid(lh, prev_blue_hand) and lh[0] < frame_center and now - last_blue_punch_time > cooldown
+            ):
+                blue_punch_count += 1
+                last_blue_punch_time = now
+                events.append((timestamp, "파란 선수", "펀치"))
+
+            if (
+                prev_right_arm_angle and abs(right_arm_angle - prev_right_arm_angle) > min_angle_change and
+                prev_red_hand and movement_valid(rh, prev_red_hand) and rh[0] >= frame_center and now - last_red_punch_time > cooldown
+            ):
+                red_punch_count += 1
+                last_red_punch_time = now
+                events.append((timestamp, "빨간 선수", "펀치"))
+
+            if (
+                prev_left_leg_angle and abs(left_leg_angle - prev_left_leg_angle) > min_angle_change and
+                prev_blue_foot and movement_valid(la, prev_blue_foot) and la[0] < frame_center and now - last_blue_kick_time > cooldown
+            ):
+                blue_kick_count += 1
+                last_blue_kick_time = now
+                events.append((timestamp, "파란 선수", "킥"))
+
+            if (
+                prev_right_leg_angle and abs(right_leg_angle - prev_right_leg_angle) > min_angle_change and
+                prev_red_foot and movement_valid(ra, prev_red_foot) and ra[0] >= frame_center and now - last_red_kick_time > cooldown
+            ):
+                red_kick_count += 1
+                last_red_kick_time = now
+                events.append((timestamp, "빨간 선수", "킥"))
+
+            prev_blue_hand = lh
+            prev_red_hand = rh
+            prev_blue_foot = la
+            prev_red_foot = ra
+
+            prev_left_arm_angle = left_arm_angle
+            prev_right_arm_angle = right_arm_angle
+            prev_left_leg_angle = left_leg_angle
+            prev_right_leg_angle = right_leg_angle
 
     cap.release()
 
