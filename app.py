@@ -6,7 +6,6 @@ import tempfile
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import timedelta
-
 import time
 
 mp_pose = mp.solutions.pose
@@ -16,9 +15,9 @@ st.set_page_config(page_title="산타 타격 횟수 분석기", layout="centered
 st.title("산타 타격 횟수 분석기")
 
 st.markdown("""
-정확도 향상 버전입니다 ✅  
-작은 움직임은 무시하고,  
-진짜 펀치·킥만 인식되도록 필터링했습니다!
+정확도 향상 + 점프 동작 필터링 ✅  
+작은 움직임 무시 + 킥은 앞/옆 방향만 인식되며,  
+뛰는 동작은 킥으로 간주되지 않도록 개선되었습니다.
 """)
 
 uploaded_file = st.file_uploader("분석할 영상 파일(mp4)을 업로드하세요", type=["mp4", "avi"])
@@ -49,8 +48,8 @@ if uploaded_file:
     last_blue_kick_time = 0
     last_red_kick_time = 0
 
-    movement_threshold = 60  # 더 많이 움직여야 타격으로 인식
-    cooldown = 0.5  # 최소 간격 0.5초
+    movement_threshold = 60  # 타격 감도
+    cooldown = 0.5  # 중복 방지 시간
 
     frame_num = 0
     events = []
@@ -61,8 +60,6 @@ if uploaded_file:
             break
 
         frame_num += 1
-
-        # 3프레임마다만 체크 (정밀도 ↑)
         if frame_num % 3 != 0:
             continue
 
@@ -85,10 +82,10 @@ if uploaded_file:
 
             now = time.time()
 
-            # 펀치
-            for hand, prev_hand, last_time, update_func, side in [
-                (left_hand, prev_blue_hand, last_blue_punch_time, lambda: 'blue', 'blue'),
-                (right_hand, prev_red_hand, last_red_punch_time, lambda: 'red', 'red'),
+            # 펀치 감지
+            for hand, prev_hand, side in [
+                (left_hand, prev_blue_hand, 'blue'),
+                (right_hand, prev_red_hand, 'red')
             ]:
                 if prev_hand and np.linalg.norm(np.array(hand) - np.array(prev_hand)) > movement_threshold:
                     if hand[0] < frame_center and now - last_blue_punch_time > cooldown:
@@ -104,20 +101,26 @@ if uploaded_file:
                 else:
                     prev_red_hand = hand
 
-            # 킥
-            for foot, prev_foot, last_time, update_func, side in [
-                (left_foot, prev_blue_foot, last_blue_kick_time, lambda: 'blue', 'blue'),
-                (right_foot, prev_red_foot, last_red_kick_time, lambda: 'red', 'red'),
+            # 킥 감지 (앞/옆 방향만, 수직 이동 제외)
+            for foot, prev_foot, side in [
+                (left_foot, prev_blue_foot, 'blue'),
+                (right_foot, prev_red_foot, 'red')
             ]:
-                if prev_foot and np.linalg.norm(np.array(foot) - np.array(prev_foot)) > movement_threshold:
-                    if foot[0] < frame_center and now - last_blue_kick_time > cooldown:
-                        blue_kick_count += 1
-                        last_blue_kick_time = now
-                        events.append((timestamp, "파란 선수", "킥"))
-                    elif foot[0] >= frame_center and now - last_red_kick_time > cooldown:
-                        red_kick_count += 1
-                        last_red_kick_time = now
-                        events.append((timestamp, "빨간 선수", "킥"))
+                if prev_foot:
+                    total_movement = np.linalg.norm(np.array(foot) - np.array(prev_foot))
+                    horizontal_movement = abs(foot[0] - prev_foot[0])  # X축
+                    vertical_movement = abs(foot[1] - prev_foot[1])    # Y축
+
+                    if horizontal_movement > 40 and total_movement > movement_threshold:
+                        if foot[0] < frame_center and now - last_blue_kick_time > cooldown:
+                            blue_kick_count += 1
+                            last_blue_kick_time = now
+                            events.append((timestamp, "파란 선수", "킥"))
+                        elif foot[0] >= frame_center and now - last_red_kick_time > cooldown:
+                            red_kick_count += 1
+                            last_red_kick_time = now
+                            events.append((timestamp, "빨간 선수", "킥"))
+
                 if foot[0] < frame_center:
                     prev_blue_foot = foot
                 else:
