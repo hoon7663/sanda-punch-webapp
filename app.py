@@ -1,4 +1,3 @@
-# app.py
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -8,6 +7,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import timedelta
 
+import time
+
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose()
 
@@ -15,9 +16,9 @@ st.set_page_config(page_title="산타 타격 횟수 분석기", layout="centered
 st.title("산타 타격 횟수 분석기")
 
 st.markdown("""
-이 웹앱은 산타 경기 영상에서 손과 발의 움직임을 추적하여
-파란 선수와 빨간 선수 각각의 펀치(손), 킥(발) 횟수를 자동으로 추정하고,
-타격 타이밍을 시각화하며 분석 결과를 CSV와 그래프로 제공합니다.
+정확도 향상 버전입니다 ✅  
+작은 움직임은 무시하고,  
+진짜 펀치·킥만 인식되도록 필터링했습니다!
 """)
 
 uploaded_file = st.file_uploader("분석할 영상 파일(mp4)을 업로드하세요", type=["mp4", "avi"])
@@ -43,7 +44,14 @@ if uploaded_file:
     prev_blue_foot = None
     prev_red_foot = None
 
-    movement_threshold = 30
+    last_blue_punch_time = 0
+    last_red_punch_time = 0
+    last_blue_kick_time = 0
+    last_red_kick_time = 0
+
+    movement_threshold = 60  # 더 많이 움직여야 타격으로 인식
+    cooldown = 0.5  # 최소 간격 0.5초
+
     frame_num = 0
     events = []
 
@@ -53,9 +61,15 @@ if uploaded_file:
             break
 
         frame_num += 1
+
+        # 3프레임마다만 체크 (정밀도 ↑)
+        if frame_num % 3 != 0:
+            continue
+
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(image_rgb)
         frame_center = frame.shape[1] // 2
+        timestamp = str(timedelta(seconds=frame_num / fps))
 
         if results.pose_landmarks:
             landmarks = results.pose_landmarks.landmark
@@ -69,28 +83,40 @@ if uploaded_file:
             right_foot = (int(landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE].x * frame.shape[1]),
                           int(landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE].y * frame.shape[0]))
 
-            timestamp = str(timedelta(seconds=frame_num / fps))
+            now = time.time()
 
-            for hand, prev_hand, label in [(left_hand, prev_blue_hand, 'blue_punch'), (right_hand, prev_red_hand, 'red_punch')]:
+            # 펀치
+            for hand, prev_hand, last_time, update_func, side in [
+                (left_hand, prev_blue_hand, last_blue_punch_time, lambda: 'blue', 'blue'),
+                (right_hand, prev_red_hand, last_red_punch_time, lambda: 'red', 'red'),
+            ]:
                 if prev_hand and np.linalg.norm(np.array(hand) - np.array(prev_hand)) > movement_threshold:
-                    if hand[0] < frame_center:
+                    if hand[0] < frame_center and now - last_blue_punch_time > cooldown:
                         blue_punch_count += 1
+                        last_blue_punch_time = now
                         events.append((timestamp, "파란 선수", "펀치"))
-                    else:
+                    elif hand[0] >= frame_center and now - last_red_punch_time > cooldown:
                         red_punch_count += 1
+                        last_red_punch_time = now
                         events.append((timestamp, "빨간 선수", "펀치"))
                 if hand[0] < frame_center:
                     prev_blue_hand = hand
                 else:
                     prev_red_hand = hand
 
-            for foot, prev_foot, label in [(left_foot, prev_blue_foot, 'blue_kick'), (right_foot, prev_red_foot, 'red_kick')]:
+            # 킥
+            for foot, prev_foot, last_time, update_func, side in [
+                (left_foot, prev_blue_foot, last_blue_kick_time, lambda: 'blue', 'blue'),
+                (right_foot, prev_red_foot, last_red_kick_time, lambda: 'red', 'red'),
+            ]:
                 if prev_foot and np.linalg.norm(np.array(foot) - np.array(prev_foot)) > movement_threshold:
-                    if foot[0] < frame_center:
+                    if foot[0] < frame_center and now - last_blue_kick_time > cooldown:
                         blue_kick_count += 1
+                        last_blue_kick_time = now
                         events.append((timestamp, "파란 선수", "킥"))
-                    else:
+                    elif foot[0] >= frame_center and now - last_red_kick_time > cooldown:
                         red_kick_count += 1
+                        last_red_kick_time = now
                         events.append((timestamp, "빨간 선수", "킥"))
                 if foot[0] < frame_center:
                     prev_blue_foot = foot
@@ -114,7 +140,6 @@ if uploaded_file:
         mime="text/csv"
     )
 
-    # 그래프 시각화
     st.subheader("선수별 기술 사용 통계 그래프")
     if not df.empty:
         chart_df = df.groupby(["선수", "기술"]).size().unstack(fill_value=0)
